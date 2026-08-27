@@ -288,6 +288,73 @@ function removePhoto(date, letter) {
 }
 
 // すべての記録を1つのテキストに' + t("書き出す", "Export") + '（バックアップ／ZINE原稿用）
+// 日付見出し（例 "AUG 21, 2026"）を YYYY-MM-DD に戻す
+var MONTHS_ABBR = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+function parseDateLabel(label) {
+  var m = label.match(/([A-Z]{3})\s+(\d{1,2}),\s*(\d{4})/);
+  if (!m) return null;
+  var mi = MONTHS_ABBR.indexOf(m[1]);
+  if (mi === -1) return null;
+  return m[3] + "-" + String(mi + 1).padStart(2, "0") + "-" + String(Number(m[2])).padStart(2, "0");
+}
+
+// EASYラベル文字列 → id の対応（buildEntryTextの出力に完全一致させる）
+var EASY_LABEL_TO_ID = {};
+EASY_QUESTIONS_JA.forEach(function (q) { EASY_LABEL_TO_ID[q.label] = q.id; });
+EASY_QUESTIONS_EN.forEach(function (q) { EASY_LABEL_TO_ID[q.label] = q.id; });
+
+// BACKUPで書き出したテキストを読み込んで、記録の配列に戻す
+// 戻り値: [{ dateKey, entry }, ...]
+function parseBackupText(text) {
+  var lines = text.replace(/\r\n/g, "\n").split("\n");
+  var results = [];
+  var current = null; // { dateKey, deep, easy, section }
+
+  function pushCurrent() {
+    if (current && current.dateKey) {
+      results.push({
+        dateKey: current.dateKey,
+        entry: { deep: { letters: current.deep }, easy: { answers: current.easy } }
+      });
+    }
+  }
+
+  lines.forEach(function (raw) {
+    var line = raw.trim();
+    if (!line) return;
+    if (line.indexOf("────") === 0) { return; }
+
+    var head = line.match(/^INDEX JOURNAL\s*[—-]\s*(.+)$/);
+    if (head) {
+      // 前の記録を確定してから、新しい記録を開始
+      pushCurrent();
+      var dk = parseDateLabel(head[1]);
+      current = { dateKey: dk, deep: {}, easy: {}, section: null };
+      return;
+    }
+    if (!current) return;
+
+    if (line === "EASY") { current.section = "easy"; return; }
+    if (line === "DEEP") { current.section = "deep"; return; }
+
+    if (current.section === "easy") {
+      var em = line.match(/^([A-Za-z ]+?)：(.+)$/);
+      if (em) {
+        var id = EASY_LABEL_TO_ID[em[1].trim()];
+        if (id) current.easy[id] = em[2].trim();
+      }
+      return;
+    }
+    if (current.section === "deep") {
+      var dm = line.match(/^([A-Za-z])｜(.+)$/);
+      if (dm) current.deep[dm[1].toUpperCase()] = dm[2].trim();
+      return;
+    }
+  });
+  pushCurrent();
+  return results;
+}
+
 function exportAll() {
   var dates = lsDates();
   var out = ["INDEX JOURNAL — EXPORT " + formatNowStamp(), "記録数：" + dates.length, ""];
@@ -554,61 +621,74 @@ function stopFalling() {
 var burstLevel = 0;
 var burstCooldown = null;
 
-function burstFalling() {
-  var motifs = getMotifs();
-  if (!motifs.length) return;
-
-  // 続けて押すほど段階が上がる（押すのをやめると少しずつ戻る）
-  burstLevel = Math.min(burstLevel + 1, 8);
-  if (burstCooldown) clearTimeout(burstCooldown);
-  burstCooldown = setTimeout(function () { burstLevel = 0; }, 2600);
-
+function ensureLayer() {
   var layer = document.getElementById("fallLayer");
   if (!layer) {
     layer = document.createElement("div");
     layer.id = "fallLayer";
     document.body.appendChild(layer);
   }
-
-  function drop() {
-    var src = motifs[Math.floor(Math.random() * motifs.length)];
-    var img = document.createElement("img");
-    img.className = "fallItem";
-    img.src = src;
-    var r = Math.random();
-    var size;
-    if (r < 0.5) size = 16 + Math.random() * 26;
-    else if (r < 0.85) size = 42 + Math.random() * 48;
-    else size = 90 + Math.random() * 100;
-    img.style.width = size + "px";
-    img.style.left = (Math.random() * 94) + "vw";
-    img.style.opacity = (0.45 + (size / 190) * 0.5).toFixed(2);
-    // 段階が上がるほど速く落ちてくる
-    var speedUp = 1 - Math.min(burstLevel * 0.07, 0.5);
-    var dur = (3200 + Math.random() * 2600 + size * 14) * speedUp;
-    var spin = (Math.random() * 900 - 450);
-    layer.appendChild(img);
-    var startT = null;
-    function step(ts) {
-      if (!startT) startT = ts;
-      var pr = (ts - startT) / dur;
-      if (pr >= 1) { img.remove(); return; }
-      var y = pr * (window.innerHeight + 240);
-      var x = Math.sin(pr * Math.PI * 2 + size) * (14 + size / 5);
-      img.style.transform = "translate(" + x + "px," + y + "px) rotate(" + (spin * pr) + "deg)";
-      requestAnimationFrame(step);
-    }
-    requestAnimationFrame(step);
-  }
-
-  // 押すたびに数が増える：14 → 28 → 42 → …（上限あり）
-  var n = 14 * burstLevel + Math.floor(Math.random() * 8);
-  n = Math.min(n, 120);
-  var gap = Math.max(14, 55 - burstLevel * 6);
-  for (var i = 0; i < n; i++) setTimeout(drop, i * gap + Math.random() * 30);
+  return layer;
 }
 
-function startFalling() { /* 自動では降らせない */ }
+// モチーフを1つ落とす
+function dropOne() {
+  var motifs = getMotifs();
+  if (!motifs.length) return;
+  var layer = ensureLayer();
+  var src = motifs[Math.floor(Math.random() * motifs.length)];
+  var img = document.createElement("img");
+  img.className = "fallItem";
+  img.src = src;
+  var r = Math.random();
+  var size;
+  if (r < 0.5) size = 16 + Math.random() * 26;
+  else if (r < 0.85) size = 42 + Math.random() * 48;
+  else size = 90 + Math.random() * 100;
+  img.style.width = size + "px";
+  img.style.left = (Math.random() * 94) + "vw";
+  img.style.opacity = (0.45 + (size / 190) * 0.5).toFixed(2);
+  var speedUp = 1 - Math.min(burstLevel * 0.07, 0.5);
+  var dur = (3200 + Math.random() * 2600 + size * 14) * speedUp;
+  var spin = (Math.random() * 900 - 450);
+  layer.appendChild(img);
+  var startT = null;
+  function step(ts) {
+    if (!startT) startT = ts;
+    var pr = (ts - startT) / dur;
+    if (pr >= 1) { img.remove(); return; }
+    var y = pr * (window.innerHeight + 240);
+    var x = Math.sin(pr * Math.PI * 2 + size) * (14 + size / 5);
+    img.style.transform = "translate(" + x + "px," + y + "px) rotate(" + (spin * pr) + "deg)";
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+// タップするたびに、降る量が増えていく
+function burstFalling() {
+  if (!getMotifs().length) return;
+  burstLevel = Math.min(burstLevel + 1, 8);
+  if (burstCooldown) clearTimeout(burstCooldown);
+  burstCooldown = setTimeout(function () { burstLevel = 0; }, 2600);
+
+  var n = Math.min(14 * burstLevel + Math.floor(Math.random() * 8), 120);
+  var gap = Math.max(14, 55 - burstLevel * 6);
+  for (var i = 0; i < n; i++) setTimeout(dropOne, i * gap + Math.random() * 30);
+}
+
+// 普段はゆっくり、ぽつぽつと降らせる
+function startFalling() {
+  if (fallTimer) { clearInterval(fallTimer); fallTimer = null; }
+  if (!getMotifs().length) return;
+  ensureLayer();
+  setTimeout(dropOne, 400);
+  fallTimer = setInterval(function () {
+    // 連打中は自動の分は控える
+    if (burstLevel > 0) return;
+    dropOne();
+  }, 3200);
+}
 
 
 /* ---------- 設定 ---------- */
@@ -767,7 +847,18 @@ function renderDesign() {
       '<p class="tiny" style="padding-top:32px;padding-bottom:12px">MOTIF　' +
         '<span style="letter-spacing:0">' + t("（タイトルをタップすると降ります）", "(tap the title to make them fall)") + '</span></p>' +
       '<div id="motifList">' + (cells || '<p class="tiny" style="padding-bottom:12px">' + t("まだありません", "None yet") + '</p>') + '</div>' +
-      '<button id="newMotif" class="primary" style="margin-top:12px">' + t("＋ 描く", "+ Draw") + '</button>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' +
+        '<button id="newMotif" class="primary">' + t("＋ 描く", "+ Draw") + '</button>' +
+        '<label class="sharebtn" style="border:1px solid ' + p.ink + ';color:' + p.ink + ';cursor:pointer">' +
+          t("＋ 写真から追加", "+ Add from photo") +
+          '<input type="file" accept="image/*" multiple class="hiddenfile" id="motifUpload"></label>' +
+      '</div>' +
+      (motifs.length ? ('<button id="exportMotifs" class="tiny" style="letter-spacing:0.08em;margin-top:16px;color:' + p.accent + '">' +
+        t("↓ モチーフをファイルに保存", "↓ Save motifs to a file") + '</button>') : '') +
+      '<div style="display:none"><input type="file" accept="application/json" id="motifImportFile"></div>' +
+      '<button id="importMotifs" class="tiny" style="letter-spacing:0.08em;margin-top:10px;display:block;color:' + p.accent + '">' +
+        t("↑ ファイルから読み込む", "↑ Load motifs from a file") + '</button>' +
+      '<p id="motifNote" class="tiny" style="padding-top:10px;line-height:1.7"></p>' +
     '</div></div>';
   document.getElementById("backBtn").addEventListener("click", renderSettings);
   Array.prototype.forEach.call(document.querySelectorAll("[data-pal]"), function (b) {
@@ -786,6 +877,93 @@ function renderDesign() {
     });
   });
   document.getElementById("newMotif").addEventListener("click", renderDraw);
+
+  // 写真からモチーフを追加
+  document.getElementById("motifUpload").addEventListener("change", function (ev) {
+    var files = Array.prototype.slice.call(ev.target.files || []);
+    ev.target.value = "";
+    if (!files.length) return;
+    var list = getMotifs();
+    var remain = Math.max(0, 12 - list.length);
+    if (!remain) {
+      document.getElementById("motifNote").textContent = t("モチーフは12個までです。", "Up to 12 motifs.");
+      return;
+    }
+    files = files.slice(0, remain);
+    var done = 0;
+    files.forEach(function (file) {
+      // 元の写真を、透明が保てるPNGとして縮小して保存
+      var reader = new FileReader();
+      reader.onload = function () {
+        var img = new Image();
+        img.onload = function () {
+          var maxDim = 300;
+          var scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          var canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(img.width * scale));
+          canvas.height = Math.max(1, Math.round(img.height * scale));
+          canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+          var data = canvas.toDataURL("image/png");
+          var cur = getMotifs();
+          if (cur.length < 12) { cur.push(data); saveMotifs(cur); }
+          done++;
+          if (done === files.length) renderDesign();
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  });
+
+  // モチーフをまとめてファイルに書き出す
+  var expBtn = document.getElementById("exportMotifs");
+  if (expBtn) expBtn.addEventListener("click", function () {
+    try {
+      var payload = JSON.stringify({ app: "index journal", type: "motifs", items: getMotifs() });
+      var blob = new Blob([payload], { type: "application/json" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "index-journal-motifs.json";
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      document.getElementById("motifNote").textContent = t("書き出しました。友達に送れます。", "Saved. You can send this to a friend.");
+    } catch (e) {
+      document.getElementById("motifNote").textContent = t("書き出せませんでした。", "Could not save.");
+    }
+  });
+
+  // ファイルからモチーフを読み込む（自分のバックアップ・友達からもらったもの両方）
+  document.getElementById("importMotifs").addEventListener("click", function () {
+    document.getElementById("motifImportFile").click();
+  });
+  document.getElementById("motifImportFile").addEventListener("change", function (ev) {
+    var file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var data = JSON.parse(reader.result);
+        var items = Array.isArray(data.items) ? data.items : (Array.isArray(data) ? data : []);
+        items = items.filter(function (s) { return typeof s === "string" && s.indexOf("data:image") === 0; });
+        if (!items.length) {
+          document.getElementById("motifNote").textContent = t("モチーフが見つかりませんでした。", "No motifs found in this file.");
+          return;
+        }
+        var cur = getMotifs();
+        var added = 0;
+        items.forEach(function (it) {
+          if (cur.length < 12) { cur.push(it); added++; }
+        });
+        saveMotifs(cur);
+        renderDesign();
+      } catch (e) {
+        document.getElementById("motifNote").textContent = t("読み込めませんでした。正しいファイルか確認してください。", "Could not read this file.");
+      }
+    };
+    reader.readAsText(file);
+  });
   document.getElementById("editCustom").addEventListener("click", renderCustom);
 }
 
@@ -1036,6 +1214,18 @@ function renderExport() {
       '<p style="font-size:12px;color:#9B9B95;padding-top:12px;line-height:1.8">' +
         '' + t("※ 上のテキストを長押しでコピーもできます。<br>", "· You can also long-press the text above to copy it.<br>") + '' +
         '' + t("※ 写真はテキストには含まれません。", "· Photos are not included in the text.") + '</p>' +
+      '<div style="border-top:1px solid #DEDEDA;margin-top:32px;padding-top:24px">' +
+        '<p class="tiny" style="padding-bottom:8px">' + t("読み込む", "RESTORE") + '</p>' +
+        '<p style="font-size:13px;line-height:1.9;color:#9B9B95;padding-bottom:10px">' +
+          t("書き出したテキストファイルを選ぶか、下に貼り付けてください。同じ日付の記録は、空欄だけ埋められます。",
+            "Choose a backup file, or paste the text below. For dates that already have entries, only empty fields are filled in.") + '</p>' +
+        '<label class="sharebtn" style="border:1px solid #111;color:#111;cursor:pointer">' + t("ファイルを選ぶ", "Choose file") +
+          '<input type="file" accept=".txt,text/plain" class="hiddenfile" id="restoreFile"></label>' +
+        '<textarea id="restoreText" rows="6" placeholder="' + t("ここに貼り付け", "Paste here") + '" ' +
+          'style="width:100%;margin-top:10px;padding:12px;font-size:13px;border:1px solid #DEDEDA;background:#FAFAF8"></textarea>' +
+        '<button id="restoreBtn" class="primary" style="margin-top:10px">' + t("読み込む", "Restore") + '</button>' +
+        '<p id="restoreNote" class="tiny" style="padding-top:10px;line-height:1.7"></p>' +
+      '</div>' +
     '</div></div>';
   document.getElementById("backBtn").addEventListener("click", renderSettings);
   document.getElementById("expShare").addEventListener("click", function () {
@@ -1046,6 +1236,50 @@ function renderExport() {
         copyText(text, "expNote");
       });
     } else { copyText(text, "expNote"); }
+  });
+  document.getElementById("restoreFile").addEventListener("change", function (ev) {
+    var file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () { document.getElementById("restoreText").value = reader.result; };
+    reader.readAsText(file);
+  });
+  document.getElementById("restoreBtn").addEventListener("click", function () {
+    var raw = document.getElementById("restoreText").value;
+    if (!raw.trim()) return;
+    var items = parseBackupText(raw);
+    if (!items.length) {
+      document.getElementById("restoreNote").textContent =
+        t("読み込める記録が見つかりませんでした。", "Could not find any entries in this text.");
+      return;
+    }
+    var restored = 0, filled = 0;
+    items.forEach(function (item) {
+      var existing = lsGet(item.dateKey) || {};
+      var deep = existing.deep && existing.deep.letters ? existing.deep.letters : {};
+      var easy = existing.easy && existing.easy.answers ? existing.easy.answers : {};
+      var mergedDeep = {};
+      ALPHABET.forEach(function (l) {
+        var cur = (deep[l] || "").trim();
+        var incoming = (item.entry.deep.letters[l] || "").trim();
+        mergedDeep[l] = cur || incoming;
+        if (!cur && incoming) filled++;
+      });
+      var mergedEasy = {};
+      EASY_QUESTIONS.forEach(function (q) {
+        var cur = (easy[q.id] || "").trim();
+        var incoming = (item.entry.easy.answers[q.id] || "").trim();
+        mergedEasy[q.id] = cur || incoming;
+        if (!cur && incoming) filled++;
+      });
+      lsSet(item.dateKey, { deep: { letters: mergedDeep }, easy: { answers: mergedEasy }, updatedAt: new Date().toISOString() });
+      restored++;
+    });
+    document.getElementById("restoreNote").textContent =
+      t(restored + "日ぶんを読み込みました（" + filled + "箇所を埋めました）。",
+        "Restored " + restored + " day(s) — filled " + filled + " field(s).");
+    document.getElementById("restoreText").value = "";
   });
   document.getElementById("expFile").addEventListener("click", function () {
     try {
